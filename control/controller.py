@@ -1,241 +1,159 @@
 """
-control/controller.py — Longitudinal and lateral vehicle control.
+control/controller.py — Temporally-consistent vehicle controller.
 
-Improvements over original
---------------------------
-Fix 4 — Safe-centre steering
-    Instead of reactively swerving away from one object, we compute a
-    "safe x" target by nudging the frame centre away from all detected
-    threats.  The error between safe_x and the frame centre becomes the
-    steering signal.  This is much more stable than instant steer-step jumps.
+Key improvements over the original:
+────────────────────────────────────────────────────────────────────────────
+1. VELOCITY EMA  — velocity glides toward its target over multiple frames
+   instead of jumping. Alpha (VELOCITY_ALPHA) is read from config.
 
-Fix 6 — Exponential smoothing on both steer and speed
-    steer_out = 0.7 * prev_steer + 0.3 * new_steer
-    speed_out = 0.7 * prev_speed + 0.3 * desired_speed
-    Eliminates jitter and chatter.
+2. RATE LIMITING — even if the EMA wants a large step, the velocity change
+   per frame is capped by MAX_ACCEL_RATE / MAX_DECEL_RATE (km/h · s⁻¹).
+   This prevents the sudden +168 km/h·s⁻² spike seen in the first frame.
 
-Fix 7 — Slow down while turning
-    speed_factor *= (1 - abs(steer))
-    Sharp turns automatically reduce speed, improving stability.
+3. STEERING EMA  — steering is also smoothed via a separate STEERING_ALPHA
+   so it doesn't snap frame-to-frame.
 
-Priority order (unchanged from original):
-  1. Lane-keeping   (road mask centre)
-  2. Safe-centre obstacle avoidance
-  3. Least-blocked-region fallback (all zones occupied)
+4. ACCELERATION SMOOTHING — the *reported* acceleration (dv/dt) is itself
+   passed through an EMA (ACCEL_SMOOTH_ALPHA) so the HUD shows a smooth,
+   believable number instead of noisy per-frame deltas.
+
+5. TEMPORAL STATE — the controller now remembers its previous velocity,
+   steering, and smoothed acceleration instead of recomputing them cold
+   every frame.
+────────────────────────────────────────────────────────────────────────────
 """
 
-from dataclasses import dataclass
-from typing import Optional, List
-
-import numpy as np
-
 import config
-from filtering.region_filter import Region, FilterResult
-from perception.detector import Detection
-from perception.road_detector import RoadResult   # RoadDetector output
 
 
-@dataclass
 class VehicleState:
-    """Live snapshot of the simulated vehicle."""
-    velocity:     float = config.INITIAL_VELOCITY
-    steering:     float = 0.0
-    acceleration: float = 0.0
-    action_label: str   = "GO"
-    steer_reason: str   = ""
+    """Snapshot returned by VehicleController.step()."""
 
-    def __str__(self) -> str:
+    def __init__(
+        self,
+        velocity:     float = 0.0,
+        steering:     float = 0.0,
+        acceleration: float = 0.0,
+        braking:      bool  = False,
+        mode:         str   = "cruise",
+    ):
+        self.velocity     = velocity
+        self.steering     = steering
+        self.acceleration = acceleration   # signed: negative = decelerating
+        self.braking      = braking
+        self.mode         = mode
+
+    def __repr__(self) -> str:
+        sign = "+" if self.acceleration >= 0 else ""
         return (
-            f"v={self.velocity:5.1f}  "
-            f"a={self.acceleration:+6.1f}  "
-            f"steer={self.steering:+.2f} ({self.steer_reason})  "
-            f"[{self.action_label}]"
+            f"VehicleState(v={self.velocity:+.2f} "
+            f"steer={self.steering:+.2f} "
+            f"accel={sign}{self.acceleration:.2f} "
+            f"brake={self.braking} mode={self.mode})"
         )
 
 
 class VehicleController:
     """
-    Stateful controller. Call step() once per frame.
+    Temporally-consistent proportional vehicle controller.
+
+    All smoothing parameters are read from config.py so they can be
+    tuned without touching this file.
+
+    Parameters
+    ----------
+    dt : float
+        Time-step in seconds (should match the pipeline frame rate).
     """
 
-    def __init__(self, dt: float = config.DT):
-        self.dt    = dt
-        self.state = VehicleState()
+    def __init__(self, dt: float = 0.1):
+        self.dt = dt
 
-        # Smoothing memory (Fix 6)
-        self._prev_steer: float = 0.0
-        self._prev_speed: float = config.INITIAL_VELOCITY
+        # ── Persistent state (updated every frame) ────────────────────────
+        self._velocity:       float = 0.0   # current smoothed velocity
+        self._steering:       float = 0.0   # current smoothed steering
+        self._smooth_accel:   float = 0.0   # smoothed acceleration (HUD display)
+        self._initialized:    bool  = False  # first-frame guard
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    # ── Public API ─────────────────────────────────────────────────────────
 
     def step(
         self,
-        threat:        Optional[Detection],
-        filter_result: Optional[FilterResult] = None,
-        lane_result    = None,        # RoadResult or LaneResult, both have .lane_centre_x
-        frame_width:   int            = config.FRAME_WIDTH,
-        frame_height:  int            = config.FRAME_HEIGHT,
-        is_spike:      bool           = False,
+        directive: "BehaviorDirective",
     ) -> VehicleState:
         """
-        Compute one control step.
-
-        Parameters
-        ----------
-        threat        : primary on-road Detection, or None
-        filter_result : full FilterResult (for per-region counts)
-        lane_result   : RoadResult / LaneResult (for road centre x)
-        frame_width   : needed to compute centre offset fraction
-        frame_height  : needed to normalise safe-centre calculation
-        is_spike      : True → noisy depth reading, hold previous accel
+        Execute the BehaviorDirective using temporal smoothing and physics rate limits.
         """
-        # -- Longitudinal -----------------------------------------------
-        if threat is None or is_spike:
-            acc, label = config.ACC_GO, "GO"
-        else:
-            acc, label = self._longitudinal(threat)
 
-        # -- Raw steering -----------------------------------------------
-        raw_steer, reason = self._lateral(
-            threat, filter_result, lane_result, frame_width, frame_height
+        # ── Config values (with safe defaults) ───────────────────────────
+        max_v            = getattr(config, "MAX_VELOCITY",      80.0)
+        max_st           = getattr(config, "MAX_STEERING",       1.0)
+        vel_alpha        = getattr(config, "VELOCITY_ALPHA",     0.08)
+        steer_alpha      = getattr(config, "STEERING_ALPHA",     0.15)
+        accel_sm_alpha   = getattr(config, "ACCEL_SMOOTH_ALPHA", 0.30)
+        max_accel_rate   = getattr(config, "MAX_ACCEL_RATE",     8.0)   # km/h / s
+        max_decel_rate   = getattr(config, "MAX_DECEL_RATE",    20.0)   # km/h / s
+
+        # ── First-frame bootstrap ─────────────────────────────────────────
+        if not self._initialized:
+            initial_v = getattr(config, "INITIAL_VELOCITY", 0.0)
+            self._velocity      = initial_v
+            self._steering      = 0.0
+            self._smooth_accel  = 0.0
+            self._initialized   = True
+
+        target_v  = directive.target_velocity
+        raw_steer = directive.target_steering
+        braking   = directive.braking
+        mode      = directive.mode
+
+        # ────────────────────────────────────────────────────────────────
+        # 1. EMA toward target  (temporal smoothing)
+        # ────────────────────────────────────────────────────────────────
+        ema_velocity = (1.0 - vel_alpha) * self._velocity + vel_alpha * target_v
+
+        # ────────────────────────────────────────────────────────────────
+        # 2. Rate limiting — cap how fast velocity can change per frame
+        # ────────────────────────────────────────────────────────────────
+        delta = ema_velocity - self._velocity
+        max_step_up   =  max_accel_rate * self.dt   # e.g.  8 * 0.1 = 0.8 km/h / frame
+        max_step_down = -max_decel_rate * self.dt   # e.g. -20 * 0.1 = -2.0 km/h / frame
+
+        delta = max(max_step_down, min(max_step_up, delta))
+        new_velocity = self._velocity + delta
+        new_velocity = max(0.0, min(max_v, new_velocity))
+
+        # ────────────────────────────────────────────────────────────────
+        # 3. Raw acceleration = dv / dt
+        # ────────────────────────────────────────────────────────────────
+        raw_accel = (new_velocity - self._velocity) / self.dt
+
+        # ────────────────────────────────────────────────────────────────
+        # 4. Smooth the reported acceleration (avoids noisy HUD display)
+        # ────────────────────────────────────────────────────────────────
+        smooth_accel = (
+            (1.0 - accel_sm_alpha) * self._smooth_accel
+            + accel_sm_alpha * raw_accel
         )
 
-        # Fix 6 — Smooth steering EMA
-        smooth_steer = 0.7 * self._prev_steer + 0.3 * raw_steer
-        smooth_steer = float(np.clip(smooth_steer, config.STEER_MIN, config.STEER_MAX))
+        # ────────────────────────────────────────────────────────────────
+        # 5. Steering with EMA  (temporal smoothing)
+        # ────────────────────────────────────────────────────────────────
+        raw_steer    = max(-max_st, min(max_st, raw_steer))
+        new_steering = (1.0 - steer_alpha) * self._steering + steer_alpha * raw_steer
+        new_steering = max(-max_st, min(max_st, new_steering))
 
-        # Fix 7 — Reduce speed proportionally while turning
-        speed_factor = 1.0 - abs(smooth_steer)   # [0, 1]
-        desired_speed = float(np.clip(
-            self._prev_speed + acc * self.dt,
-            config.MIN_VELOCITY,
-            config.MAX_VELOCITY,
-        )) * speed_factor
+        # ────────────────────────────────────────────────────────────────
+        # 6. Persist state for the next frame
+        # ────────────────────────────────────────────────────────────────
+        self._velocity      = new_velocity
+        self._steering      = new_steering
+        self._smooth_accel  = smooth_accel
 
-        # Fix 6 — Smooth speed EMA
-        smooth_speed = 0.7 * self._prev_speed + 0.3 * desired_speed
-        smooth_speed = float(np.clip(smooth_speed, config.MIN_VELOCITY, config.MAX_VELOCITY))
-
-        # -- Update state -----------------------------------------------
-        self.state.acceleration = acc
-        self.state.action_label = label
-        self.state.steering     = smooth_steer
-        self.state.steer_reason = reason
-        self.state.velocity     = smooth_speed
-
-        # Advance smoothing memory
-        self._prev_steer = smooth_steer
-        self._prev_speed = smooth_speed
-
-        return self.state
-
-    # ------------------------------------------------------------------
-    # Private: longitudinal
-    # ------------------------------------------------------------------
-
-    def _longitudinal(self, threat: Detection):
-        depth = threat.depth      # now a geometry-based closeness in [0,1]
-        if depth > config.DEPTH_HARD_BRAKE:
-            acc, label = config.ACC_HARD_BRAKE, "HARD BRAKE"
-        elif depth > config.DEPTH_BRAKE:
-            acc, label = config.ACC_BRAKE, "BRAKE"
-        elif depth > config.DEPTH_SLOW:
-            acc, label = config.ACC_SLOW, "SLOW"
-        else:
-            acc, label = config.ACC_GO, "GO"
-
-        if threat.approaching:
-            acc  += config.ACC_APPROACHING_PENALTY
-            label = label + " ⚠ APPROACH"
-
-        return acc, label
-
-    # ------------------------------------------------------------------
-    # Private: lateral (safe-centre + three-priority steering)
-    # ------------------------------------------------------------------
-
-    def _lateral(
-        self,
-        threat:        Optional[Detection],
-        filter_result: Optional[FilterResult],
-        lane_result,
-        frame_width:   int,
-        frame_height:  int,
-    ):
-        """
-        Return (steer_delta, reason_string).
-
-        Priority 1: road-centre keeping (from segmentation mask)
-        Priority 2: safe-centre obstacle avoidance
-        Priority 3: steer toward least-blocked region (all blocked)
-        """
-
-        # -- Priority 1: Road/Lane-centre keeping -----------------------
-        lane_delta   = 0.0
-        has_lane     = False
-        if lane_result is not None and lane_result.lane_centre_x is not None:
-            offset = lane_result.lane_centre_x - (frame_width / 2.0)
-            norm_offset = offset / (frame_width / 2.0)
-            lane_delta  = float(np.clip(
-                norm_offset * config.LANE_CENTRE_STEER_GAIN,
-                config.STEER_MIN,
-                config.STEER_MAX,
-            ))
-            has_lane = abs(lane_delta) > 0.03
-
-        # -- Priority 2: Safe-centre avoidance (Fix 4) ------------------
-        obstacle_delta = 0.0
-        reason         = "cruise"
-
-        if filter_result is not None and filter_result.relevant:
-            # All three regions blocked? → Priority 3
-            counts      = filter_result.counts
-            all_blocked = all(counts.get(r, 0) > 0 for r in Region)
-            if all_blocked and filter_result.least_blocked is not None:
-                lb_delta = self._steer_toward(filter_result.least_blocked)
-                if has_lane:
-                    combined = lane_delta * 0.5 + lb_delta * 0.5
-                    return float(np.clip(combined, config.STEER_MIN, config.STEER_MAX)), "lane+least-blocked"
-                return float(np.clip(lb_delta, config.STEER_MIN, config.STEER_MAX)), "least-blocked"
-
-            # Safe-centre: nudge away from each detected threat
-            safe_x = frame_width / 2.0
-            for obj in filter_result.relevant:
-                obj_cx = (obj.x1 + obj.x2) / 2.0
-                if obj_cx < safe_x:
-                    safe_x += 40.0   # nudge right
-                else:
-                    safe_x -= 40.0   # nudge left
-
-            safe_x = float(np.clip(safe_x, 0, frame_width))
-            error  = safe_x - (frame_width / 2.0)
-            obstacle_delta = float(np.clip(
-                0.005 * error,
-                config.STEER_MIN,
-                config.STEER_MAX,
-            ))
-            reason = "safe-centre"
-
-        # -- Blend lane + obstacle --------------------------------------
-        if has_lane:
-            # Lane dominates, obstacle adds urgency
-            combined = lane_delta * 0.6 + obstacle_delta * 0.4
-            return float(np.clip(combined, config.STEER_MIN, config.STEER_MAX)), "lane+avoid"
-
-        if abs(obstacle_delta) > 1e-6:
-            return float(np.clip(obstacle_delta, config.STEER_MIN, config.STEER_MAX)), reason
-
-        return 0.0, "cruise"
-
-    @staticmethod
-    def _steer_toward(region: Region) -> float:
-        """Steer toward a given region (move away from obstacles elsewhere)."""
-        if region == Region.LEFT:
-            return -config.STEER_STEP   # steer left
-        if region == Region.RIGHT:
-            return +config.STEER_STEP   # steer right
-        return 0.0                      # CENTER clear → go straight
-
-
+        return VehicleState(
+            velocity=new_velocity,
+            steering=new_steering,
+            acceleration=smooth_accel,
+            braking=braking,
+            mode=mode,
+        )

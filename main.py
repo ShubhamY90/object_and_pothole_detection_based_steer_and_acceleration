@@ -36,9 +36,10 @@ if _PROJECT_ROOT in sys.path:
 sys.path.insert(0, _PROJECT_ROOT)
 
 import config
-from perception    import ObjectDetector, RoadDetector
 from filtering     import filter_detections, select_primary_threat, FilterResult
 from tracking      import MotionTracker
+from decision      import BehaviorPlanner
+from perception.pothole_detector import PotholeDetector
 from control       import VehicleController
 from visualization import render
 from utils         import iter_frames
@@ -58,9 +59,12 @@ def build_pipeline():
 
     # Fix 2 — MotionTracker now uses bbox-geometry depth; no MiDaS needed
     tracker    = MotionTracker()
+    print("[INFO] Loading Pothole detector …")
+    pothole_detector = PotholeDetector()
+    planner    = BehaviorPlanner()
     controller = VehicleController(dt=config.DT)
 
-    return detector, road_detector, tracker, controller
+    return detector, road_detector, pothole_detector, tracker, planner, controller
 
 
 # ---------------------------------------------------------------------------
@@ -121,24 +125,24 @@ def run(
             spike = tracker.is_spike(threat.depth)
 
         # ------------------------------------------------------------------
-        # 5. CONTROL
-        #    Fix 4,6,7: safe-centre steering + EMA smoothing + turn-speed.
-        #    lane_result argument accepts RoadResult (duck-typed).
+        # 5.5 Pothole Detection & Decision Layer
         # ------------------------------------------------------------------
-        state = controller.step(
-            threat        = threat,
-            filter_result = filter_result,
-            lane_result   = road_result,    # has .lane_centre_x just like LaneResult
-            frame_width   = w,
-            frame_height  = h,
-            is_spike      = spike,
+        pothole_detected = pothole_detector.detect(frame)
+        
+        directive = planner.plan(
+            threat=threat,
+            filter_result=filter_result,
+            lane_result=road_result,
+            pothole_detected=pothole_detected,
+            frame_width=w,
+            frame_height=h,
+            is_spike=spike,
         )
 
         # ------------------------------------------------------------------
-        # ★ EXTENSION POINT ★
-        # pothole_mask = pothole_detector.detect(frame)
-        # state = controller.apply_pothole_override(state, pothole_mask)
+        # 6. Control (Execution)
         # ------------------------------------------------------------------
+        state = controller.step(directive)
 
         # ------------------------------------------------------------------
         # 6. VISUALISATION

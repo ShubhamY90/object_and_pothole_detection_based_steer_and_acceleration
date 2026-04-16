@@ -78,6 +78,28 @@ MAX_VELOCITY     = 80.0
 MIN_VELOCITY     =  0.0
 DT               = 0.1    # seconds per frame step
 
+# Temporal smoothing — controls how quickly velocity & steering can change.
+# Lower = smoother / slower reaction.  Higher = snappier.
+#
+# VELOCITY: EMA weight applied to the *target* velocity each frame.
+#   0.05 = very gradual (ramp over ~20 frames)
+#   0.20 = moderate   (ramp over ~5 frames)
+VELOCITY_ALPHA   = 0.08
+
+# STEERING: EMA weight (separate from velocity).
+#   0.15 = smooth but responsive
+STEERING_ALPHA   = 0.15
+
+# Hard rate-limits (km/h per second).  Prevents the controller from
+# applying unrealistically large accelerations in a single step.
+# E.g. MAX_ACCEL_RATE = 8  → a car can gain at most 8 km/h per second.
+MAX_ACCEL_RATE   =  8.0   # km/h per second  (positive = speeding up)
+MAX_DECEL_RATE   = 20.0   # km/h per second  (positive magnitude = slowing down)
+
+# How much of the previous *output* acceleration is blended into the new one.
+# Gives acceleration itself temporal inertia (avoids step jumps in the HUD).
+ACCEL_SMOOTH_ALPHA = 0.3  # 0 = no inertia, 1 = never changes
+
 # ---------------------------------------------------------------------------
 # Steering
 # ---------------------------------------------------------------------------

@@ -176,13 +176,12 @@ def draw_hud(
 
     cv2.putText(frame, f"SPEED : {state.velocity:5.1f} km/h",   (10, base_y),           font, 0.60, white, 1, cv2.LINE_AA)
     cv2.putText(frame, f"ACCEL : {state.acceleration:+6.1f}",   (10, base_y + gap),      font, 0.60, white, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"ACTION: {state.action_label}",         (10, base_y + 2 * gap),  font, 0.60,
-                warn if "BRAKE" in state.action_label else white, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"MODE  : {state.mode.upper()}",         (10, base_y + 2 * gap),  font, 0.60,
+                warn if state.braking else white, 1, cv2.LINE_AA)
     cv2.putText(frame, f"STEER : {state.steering:+.2f}  {_steer_label(state.steering)}", (10, base_y + 3 * gap), font, 0.60, white, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"REASON: {state.steer_reason}",         (10, base_y + 4 * gap),  cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
 
     if threat and threat.approaching:
-        cv2.putText(frame, "▲ APPROACHING", (10, base_y + 5 * gap),
+        cv2.putText(frame, "▲ APPROACHING", (10, base_y + 4 * gap),
                     font, 0.70, warn, 2, cv2.LINE_AA)
 
     return frame

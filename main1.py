@@ -45,9 +45,12 @@ from perception                         import ObjectDetector
 from perception.road_detector_fastscnn  import FastSCNNRoadDetector
 from filtering                          import filter_detections, select_primary_threat
 from tracking                           import MotionTracker
+from decision                           import BehaviorPlanner
+from perception.pothole_detector        import PotholeDetector
 from control                            import VehicleController
 from visualization                      import render
 from utils                              import iter_frames
+from led_signal                         import send_leds
 
 
 # ---------------------------------------------------------------------------
@@ -176,10 +179,13 @@ def build_pipeline(infer_size: tuple[int, int] | None = None):
         print(f"[INFO] Fast-SCNN inference resolution overridden to {infer_size}")
 
     tracker    = MotionTracker()
+    print("[INFO] Loading Pothole detector …")
+    pothole_detector = PotholeDetector()
+    planner    = BehaviorPlanner()
     controller = VehicleController(dt=config.DT)
     fps_tracker = FPSTracker(window=30)
 
-    return detector, road_detector, tracker, controller, fps_tracker
+    return detector, road_detector, pothole_detector, tracker, planner, controller, fps_tracker
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +199,7 @@ def run(
     window_title: str           = "Fast-SCNN Pipeline — FPS Benchmark",
     infer_size:   tuple | None  = None,
 ):
-    detector, road_detector, tracker, controller, fps_tracker = build_pipeline(infer_size)
+    detector, road_detector, pothole_detector, tracker, planner, controller, fps_tracker = build_pipeline(infer_size)
 
     if save_path:
         output_dir = os.path.dirname(os.path.abspath(save_path))
@@ -246,16 +252,24 @@ def run(
             spike = tracker.is_spike(threat.depth)
 
         # ------------------------------------------------------------------
-        # 6. Control
+        # 5.5 Pothole Detection & Decision Layer
         # ------------------------------------------------------------------
-        state = controller.step(
-            threat        = threat,
-            filter_result = filter_result,
-            lane_result   = road_result,
-            frame_width   = w,
-            frame_height  = h,
-            is_spike      = spike,
+        pothole_detected = pothole_detector.detect(frame)
+        
+        directive = planner.plan(
+            threat=threat,
+            filter_result=filter_result,
+            lane_result=road_result,
+            pothole_detected=pothole_detected,
+            frame_width=w,
+            frame_height=h,
+            is_spike=spike,
         )
+
+        # ------------------------------------------------------------------
+        # 6. Control (Execution)
+        # ------------------------------------------------------------------
+        state = controller.step(directive)
 
         # ------------------------------------------------------------------
         # 7. Visualisation
@@ -268,6 +282,11 @@ def run(
             lane_result   = road_result,
             show_regions  = True,
         )
+
+        # ------------------------------------------------------------------
+        # 7.5 Send LED Signals & Log to Dataset
+        # ------------------------------------------------------------------
+        send_leds(state.velocity, state.steering)
 
         # ------------------------------------------------------------------
         # 8. FPS Overlay
