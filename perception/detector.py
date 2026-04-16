@@ -65,6 +65,9 @@ class ObjectDetector:
 
     def __init__(self, model_path: str = config.YOLO_MODEL):
         self.model = YOLO(model_path)
+        import torch
+        if torch.cuda.is_available():
+            self.model.to('cuda')
 
     def detect(self, frame: np.ndarray) -> List[Detection]:
         """

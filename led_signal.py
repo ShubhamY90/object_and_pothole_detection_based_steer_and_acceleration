@@ -32,6 +32,7 @@ import config
 
 # ── Module-level state ──────────────────────────────────────────────────────
 _csv_header_written: bool = False
+_last_error_time: float = 0.0
 
 
 # ── Dataset logger ───────────────────────────────────────────────────────────
@@ -110,7 +111,7 @@ def _compute_direction_pins(
     LEFT and RIGHT are mutually exclusive by the dead-band logic.
     """
     dead_v     = getattr(config, "LED_DEAD_V",     0.05)
-    dead_steer = getattr(config, "LED_DEAD_STEER", 0.05)
+    dead_steer = 0.00  # FORCED TO 0.00 FOR TESTING (triggers on any microscopic turn)
 
     up    = 1 if velocity  >  dead_v     else 0
     down  = 1 if velocity  < -dead_v     else 0
@@ -142,7 +143,7 @@ def send_leds(velocity: float, steering: float) -> None:
     dead_v     = getattr(config, "LED_DEAD_V",     0.05)
     max_vel    = getattr(config, "MAX_VELOCITY",    1.0)
     dead_steer = getattr(config, "LED_DEAD_STEER", 0.05)
-    esp_ip     = getattr(config, "LED_ESP32_IP",   "http://192.168.4.1")
+    esp_ip     = getattr(config, "LED_ESP32_IP",   "http://192.168.4.1:81")
 
     # ── PWM: green (forward speed) ────────────────────────────────────────
     if velocity > dead_v:
@@ -171,22 +172,26 @@ def send_leds(velocity: float, steering: float) -> None:
     up, down, left, right = _compute_direction_pins(velocity, steering)
 
     # ── HTTP: send everything in one GET request ──────────────────────────
-    # [COMMENTED OUT] to prevent DNS blocking (FPS drop) when ESP32 is offline
-    # try:
-    #     requests.get(
-    #         f"{esp_ip}/led",
-    #         params={
-    #             "g":     g,
-    #             "r":     r,
-    #             "up":    up,     # → GPIO 12
-    #             "down":  down,   # → GPIO 13
-    #             "left":  left,   # → GPIO 14
-    #             "right": right,  # → GPIO 15
-    #         },
-    #         timeout=0.1,
-    #     )
-    # except requests.exceptions.RequestException:
-    #     pass   # never stall the driving loop
+    # [UNCOMMENTED] to send live signals. Timeout is kept very short to prevent stalling.
+    try:
+        url = f"{esp_ip}/led"
+        requests.get(
+            url,
+            params={
+                "g":     g,
+                "r":     r,
+                "up":    up,
+                "down":  down,
+                "left":  left,
+                "right": right,
+            },
+            timeout=0.8,
+        )
+    except requests.exceptions.RequestException as e:
+        global _last_error_time
+        if time.time() - _last_error_time > 2.0:
+            print(f"[{time.time():.0f}] [WARN] ESP32 Wi-Fi Error: {type(e).__name__} - Please check if IPs match!")
+            _last_error_time = time.time()
 
     # ── Dataset: log every call ───────────────────────────────────────────
     _log_to_dataset(velocity, steering, g, r, up, down, left, right)
