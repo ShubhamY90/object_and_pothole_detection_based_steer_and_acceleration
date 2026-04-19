@@ -192,6 +192,6 @@ ROAD_ROI_TOP_FRACTION = 0.50
 # ---------------------------------------------------------------------------
 # LED ESP32
 # ---------------------------------------------------------------------------
-LED_ESP32_IP  = "http://espcam.local"   # ← replace with your ESP32 DevKit V1 IP
+LED_ESP32_IP  = "http://10.46.37.132"   # ← replace with your ESP32 DevKit V1 IP
 LED_DEAD_V     = 0.3             # ignore tiny velocity values
 LED_DEAD_STEER = 0.05            # ignore tiny steer (cruise)

@@ -1,11 +1,11 @@
 """
-main3.py — Fast-SCNN autonomous driving pipeline + ESP32-CAM Simulation.
+main4.py — Live ESP32-CAM driving pipeline + LED sequencing
 
-Differences from main1.py
+Differences from main3.py
 -------------------------
-* Preprocesses every frame to simulate an ESP32-CAM stream:
-  - Resizes to QVGA (320x240)
-  - Adds Gaussian noise and JPEG compression artifacts.
+* Pulls real MJPEG frames from the ESP32-CAM.
+* Toggles the ESP32 camera sensor on/off via HTTP to free up resources 
+  so the LEDs can animate smoothly without the Wi-Fi/I2S starving.
 """
 
 import argparse
@@ -170,34 +170,20 @@ def build_pipeline(infer_size: tuple[int, int] | None = None):
     return detector, road_detector, pothole_detector, tracker, planner, controller, fps_tracker
 
 # ---------------------------------------------------------------------------
-# ESP32-CAM Simulation
+# ESP32 Stream URL
 # ---------------------------------------------------------------------------
-def simulate_esp32cam(frame: np.ndarray) -> np.ndarray:
-    """Resizes to 320x240 and adds noise/compression artifacts to simulate ESP32-CAM."""
-    # 1. Resize to QVGA (320x240)
-    frame_resized = cv2.resize(frame, (320, 240))
-    
-    # 2. Add random Gaussian noise to simulate cheap sensor
-    noise = np.random.normal(0, 15, frame_resized.shape).astype(np.float32)
-    noisy_frame = cv2.add(frame_resized.astype(np.float32), noise)
-    noisy_frame = np.clip(noisy_frame, 0, 255).astype(np.uint8)
-    
-    # 3. Add JPEG compression artifacts (ESP32-CAM uses low-quality MJPEG encoding)
-    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 30] # Low quality JPEG
-    _, encimg = cv2.imencode('.jpg', noisy_frame, encode_param)
-    decimg = cv2.imdecode(encimg, 1)
-    
-    return decimg
+# The stream is now hosted on the unified port 80
+
 
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
 def run(
-    data_folder:  str,
+    base_ip:      str,
     display:      bool          = True,
     save_path:    str           = "",
-    window_title: str           = "ESP32-CAM Simulation Pipeline",
+    window_title: str           = "Live ESP32-CAM Pipeline",
     infer_size:   tuple | None  = None,
 ):
     detector, road_detector, pothole_detector, tracker, planner, controller, fps_tracker = build_pipeline(infer_size)
@@ -207,24 +193,28 @@ def run(
         os.makedirs(output_dir, exist_ok=True)
         print(f"[INFO] Output directory ready: {output_dir}")
 
+    # Open Stream
+    stream_url = f"{base_ip}/stream"
+    print(f"[INFO] Connecting to MJPEG stream {stream_url} ...")
+    cap = cv2.VideoCapture(stream_url)
+    
+    if not cap.isOpened():
+        print("[ERROR] Failed to open stream. Exiting...")
+        return
+
     writer      = None
     frame_idx   = 0
-
-    def endless_frames(folder):
-        while True:
-            for item in iter_frames(folder):
-                yield item
-
     running = True
-    for filename, frame in endless_frames(data_folder):
-        if not running:
-            break
 
-        # ------------------------------------------------------------------
-        # 0. ESP32-CAM Pre-processing
-        # ------------------------------------------------------------------
-        frame = simulate_esp32cam(frame)
-        
+    while running:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            print("[WARN] Dropped frame from stream")
+            time.sleep(0.5)
+            # Try to reconnect
+            cap = cv2.VideoCapture(stream_url)
+            continue
+            
         t_frame_start = time.perf_counter()
         h, w = frame.shape[:2]
 
@@ -304,7 +294,9 @@ def run(
         # ------------------------------------------------------------------
         # 7.5 Send LED Signals & Log to Dataset
         # ------------------------------------------------------------------
-        send_leds(state.velocity, state.steering)
+        # NEW ARDUINO CODE ALLOWS CONTINUOUS SENDING
+        if state is not None:
+            send_leds(state.velocity, state.steering)
 
         # ------------------------------------------------------------------
         # 8. FPS Overlay
@@ -322,7 +314,7 @@ def run(
         final_display = np.hstack((annotated, side_panel))
 
         # ------------------------------------------------------------------
-        # 9. Terminal benchmark report every 30 frames
+        # 9. Terminal benchmark report
         # ------------------------------------------------------------------
         frame_idx += 1
         if frame_idx % 30 == 0:
@@ -331,16 +323,7 @@ def run(
                 f"PIPE={fps_tracker.pipe_fps:5.1f} FPS  "
                 f"SEG={fps_tracker.seg_fps:5.1f} FPS  "
                 f"YOLO={fps_tracker.mean_yolo_ms:5.1f}ms  "
-                f"SEG={fps_tracker.mean_seg_ms:5.1f}ms  "
                 f"TOTAL={fps_tracker.mean_total_ms:5.1f}ms  "
-                f"MASK={fps_tracker.last_mask_source}"
-            )
-        else:
-            print(
-                f"[{filename}]  {state}  "
-                f"| seg={seg_ms:.1f}ms  "
-                f"mask={road_result.mask_source}  "
-                f"pipe={fps_tracker.pipe_fps:.1f}fps"
             )
 
         # ------------------------------------------------------------------
@@ -348,18 +331,10 @@ def run(
         # ------------------------------------------------------------------
         if display:
             cv2.imshow(window_title, final_display)
-            
-            # FPS Limiter (slow down to TARGET_FPS)
-            elapsed_ms = (time.perf_counter() - t_frame_start) * 1000.0
-            target_ms = 1000.0 / config.TARGET_FPS
-            wait_time = int(max(1, target_ms - elapsed_ms))
-            
-            key = cv2.waitKey(wait_time)
+            key = cv2.waitKey(1)
             if key == 27:
                 running = False
                 break
-            if key == ord("p"):
-                cv2.waitKey(0)
 
         if save_path:
             if writer is None:
@@ -400,35 +375,25 @@ def run(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="ESP32-CAM Simulation Pipeline using Fast-SCNN + YOLO"
+        description="ESP32-CAM Live Pipeline using Fast-SCNN + YOLO"
     )
-    parser.add_argument("--data", "-d", default="data/kitti/image_02/data",
-                        help="Path to folder of input frames")
     parser.add_argument("--no-display", action="store_true",
                         help="Disable OpenCV window (headless / max FPS test)")
     parser.add_argument("--save", "-s", default="", metavar="OUTPUT.mp4",
                         help="Save annotated output to this video file")
     parser.add_argument(
         "--infer-size", default=None, metavar="WxH",
-        help=(
-            "Fast-SCNN inference resolution, e.g. 512x256 (default) "
-            "or 256x128 (fastest). Format: WIDTHxHEIGHT"
-        ),
+        help="Fast-SCNN inference resolution, e.g. 512x256 (default). Format: WIDTHxHEIGHT"
     )
     parser.add_argument(
         "--esp-ip", default="10.46.37.132", metavar="IP",
-        help="The local IP address of your Arduino ESP32 server, e.g. 10.46.37.132"
+        help="The local IP address (without port or http) of your ESP32, e.g. 10.46.37.132"
     )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-
-    if not os.path.isdir(args.data):
-        print(f"[ERROR] Data folder not found: '{args.data}'")
-        print("        Pass correct path with --data")
-        sys.exit(1)
 
     infer_size = None
     if args.infer_size:
@@ -439,21 +404,18 @@ if __name__ == "__main__":
             print(f"[ERROR] --infer-size must be WxH, e.g. 512x256. Got: {args.infer_size}")
             sys.exit(1)
 
-    # Format IP and set config
+    # Format the IP correctly
     base_ip = args.esp_ip
     if not base_ip.startswith("http://"):
         base_ip = f"http://{base_ip}"
-    if ":" in base_ip.split("//")[1]:
-        # User passed a port, remove it for base url
-        base_ip = "http://" + base_ip.split("//")[1].split(":")[0]
 
-    # Forcefully overwrite the ESP32 IP in config
+    # Forcefully overwrite the ESP32 IP in config so led_signal.py hits the new port 80
     import config
     config.LED_ESP32_IP = f"{base_ip}"
-    print(f"[INFO] ESP32 Wi-Fi Command IP set to: {config.LED_ESP32_IP}/led")
+    print(f"[INFO] ESP32 Wi-Fi LED Command IP set to: {config.LED_ESP32_IP}/led")
 
     run(
-        data_folder = args.data,
+        base_ip     = base_ip,
         display     = not args.no_display,
         save_path   = args.save,
         infer_size  = infer_size,
