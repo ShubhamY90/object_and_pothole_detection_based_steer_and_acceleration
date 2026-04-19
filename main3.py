@@ -304,6 +304,7 @@ def run(
         # ------------------------------------------------------------------
         # 7.5 Send LED Signals & Log to Dataset
         # ------------------------------------------------------------------
+        print("LED Signals: ", state.velocity, state.steering)
         send_leds(state.velocity, state.steering)
 
         # ------------------------------------------------------------------
@@ -325,23 +326,23 @@ def run(
         # 9. Terminal benchmark report every 30 frames
         # ------------------------------------------------------------------
         frame_idx += 1
-        if frame_idx % 30 == 0:
-            print(
-                f"[BENCH #{frame_idx:04d}]  "
-                f"PIPE={fps_tracker.pipe_fps:5.1f} FPS  "
-                f"SEG={fps_tracker.seg_fps:5.1f} FPS  "
-                f"YOLO={fps_tracker.mean_yolo_ms:5.1f}ms  "
-                f"SEG={fps_tracker.mean_seg_ms:5.1f}ms  "
-                f"TOTAL={fps_tracker.mean_total_ms:5.1f}ms  "
-                f"MASK={fps_tracker.last_mask_source}"
-            )
-        else:
-            print(
-                f"[{filename}]  {state}  "
-                f"| seg={seg_ms:.1f}ms  "
-                f"mask={road_result.mask_source}  "
-                f"pipe={fps_tracker.pipe_fps:.1f}fps"
-            )
+        # if frame_idx % 30 == 0:
+        #     print(
+        #         f"[BENCH #{frame_idx:04d}]  "
+        #         f"PIPE={fps_tracker.pipe_fps:5.1f} FPS  "
+        #         f"SEG={fps_tracker.seg_fps:5.1f} FPS  "
+        #         f"YOLO={fps_tracker.mean_yolo_ms:5.1f}ms  "
+        #         f"SEG={fps_tracker.mean_seg_ms:5.1f}ms  "
+        #         f"TOTAL={fps_tracker.mean_total_ms:5.1f}ms  "
+        #         f"MASK={fps_tracker.last_mask_source}"
+        #     )
+        # else:
+        #     print(
+        #         f"[{filename}]  {state}  "
+        #         f"| seg={seg_ms:.1f}ms  "
+        #         f"mask={road_result.mask_source}  "
+        #         f"pipe={fps_tracker.pipe_fps:.1f}fps"
+        #     )
 
         # ------------------------------------------------------------------
         # 10. Display / Save
@@ -373,21 +374,21 @@ def run(
         pass
 
     # Final summary
-    print("\n" + "=" * 60)
-    print("  FAST-SCNN BENCHMARK SUMMARY")
-    print("=" * 60)
-    print(f"  Frames processed : {frame_idx}")
-    print(f"  Inference res    : {road_detector._INFER_W}×{road_detector._INFER_H}")
-    print(f"  Device           : {road_detector._device}")
-    active_seg_model = "Fast-SCNN" if road_detector._weights_loaded else "Torchvision LRASPP"
-    print(f"  Segmentation Model: {active_seg_model}")
-    print(f"  Last mask source : {fps_tracker.last_mask_source}")
-    print(f"  YOLO avg latency : {fps_tracker.mean_yolo_ms:.1f} ms")
-    print(f"  SEG  avg latency : {fps_tracker.mean_seg_ms:.1f} ms")
-    print(f"  Total avg latency: {fps_tracker.mean_total_ms:.1f} ms")
-    print(f"  Seg-only FPS     : {fps_tracker.seg_fps:.1f}")
-    print(f"  Full pipeline FPS: {fps_tracker.pipe_fps:.1f}")
-    print("=" * 60)
+    # print("\n" + "=" * 60)
+    # print("  FAST-SCNN BENCHMARK SUMMARY")
+    # print("=" * 60)
+    # print(f"  Frames processed : {frame_idx}")
+    # print(f"  Inference res    : {road_detector._INFER_W}×{road_detector._INFER_H}")
+    # print(f"  Device           : {road_detector._device}")
+    # active_seg_model = "Fast-SCNN" if road_detector._weights_loaded else "Torchvision LRASPP"
+    # print(f"  Segmentation Model: {active_seg_model}")
+    # print(f"  Last mask source : {fps_tracker.last_mask_source}")
+    # print(f"  YOLO avg latency : {fps_tracker.mean_yolo_ms:.1f} ms")
+    # print(f"  SEG  avg latency : {fps_tracker.mean_seg_ms:.1f} ms")
+    # print(f"  Total avg latency: {fps_tracker.mean_total_ms:.1f} ms")
+    # print(f"  Seg-only FPS     : {fps_tracker.seg_fps:.1f}")
+    # print(f"  Full pipeline FPS: {fps_tracker.pipe_fps:.1f}")
+    # print("=" * 60)
 
     if writer is not None:
         writer.release()
